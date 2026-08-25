@@ -8,6 +8,8 @@ import hashlib
 import hmac
 import json
 import logging
+import socket
+import threading
 import time
 
 OPTIONS_PATH = Path("/data/options.json")
@@ -15,6 +17,7 @@ QUEUE_PATH = Path("/data/pending-packet.json")
 STATUS_PATH = Path("/data/relay-status.json")
 last_forward_at = 0.0
 pending_packet = None
+UPLOAD_HOST = "rtupdate.wunderground.com"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -43,6 +46,66 @@ def save_status(**changes):
     current.update(changes)
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATUS_PATH.write_text(json.dumps(current, separators=(",", ":")), encoding="utf-8")
+
+def local_ip():
+    """Return the LAN address other devices should use to reach this host."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("1.1.1.1", 53))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+def dns_question(packet):
+    if len(packet) < 17:
+        raise ValueError("DNS request is too short")
+    labels, position = [], 12
+    while True:
+        length = packet[position]
+        position += 1
+        if length == 0:
+            break
+        if length > 63 or position + length > len(packet):
+            raise ValueError("DNS question is malformed")
+        labels.append(packet[position:position + length].decode("ascii"))
+        position += length
+    if position + 4 > len(packet):
+        raise ValueError("DNS question is incomplete")
+    question_end = position + 4
+    query_type = int.from_bytes(packet[position:position + 2], "big")
+    return ".".join(labels).lower(), query_type, question_end
+
+def local_dns_answer(packet, question_end):
+    header = packet[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00"
+    answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + socket.inet_aton(local_ip())
+    return header + packet[12:question_end] + answer
+
+def forward_dns(packet, upstream):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.settimeout(3)
+        client.sendto(packet, (upstream, 53))
+        return client.recv(4096)
+
+def serve_dns():
+    config = options()
+    upstream = config.get("upstream_dns", "1.1.1.1")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", 53))
+        logging.info("Local DNS listening on port 53; redirecting %s to %s", UPLOAD_HOST, local_ip())
+        while True:
+            packet, address = server.recvfrom(4096)
+            try:
+                hostname, query_type, question_end = dns_question(packet)
+                if hostname == UPLOAD_HOST and query_type in (1, 255):
+                    response = local_dns_answer(packet, question_end)
+                    save_status(lastDnsRedirectAt=utc_now(), lastError=None)
+                else:
+                    response = forward_dns(packet, upstream)
+                server.sendto(response, address)
+            except Exception as error:
+                save_status(lastError=f"DNS: {error}")
+                logging.warning("DNS request failed: %s", error)
 
 def forward(packet):
     config = options()
@@ -119,5 +182,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"relay unavailable: {error}".encode("utf-8"))
 
 if __name__ == "__main__":
-    logging.info("The Gauge Relay listening on port 80")
+    threading.Thread(target=serve_dns, daemon=True).start()
+    logging.info("The Gauge Bridge listening on ports 53 and 80")
     ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()

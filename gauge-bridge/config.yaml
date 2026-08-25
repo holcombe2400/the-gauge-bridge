@@ -1,5 +1,5 @@
 name: The Gauge Bridge
-version: 0.1.0
+version: 0.2.0
 slug: gauge_bridge
 description: Connects a Vevor weather station to The Gauge without using Weather Underground.
 url: https://github.com/holcombe2400/the-gauge-bridge
@@ -15,8 +15,10 @@ options:
   station_code: ""
   relay_secret: ""
   upload_interval_seconds: 60
+  upstream_dns: "1.1.1.1"
 schema:
   gauge_url: url
   station_code: str
   relay_secret: password
   upload_interval_seconds: int(30,300)
+  upstream_dns: str
